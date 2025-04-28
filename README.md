@@ -206,5 +206,5 @@ source ~/.cp-helper/bashrc_snippet.sh
 
 ## 📄 License
 
-MIT © Your Name
+This file is licensed under the Apache License. See the [LICENSE](LICENSE) file for details.
 
