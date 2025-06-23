@@ -38,10 +38,9 @@ A lightweight helper to submit solutions directly from Vim or shell using the CP
 6. **Add Vim mapping**. In your `~/.vimrc` include:
    ```vim
    " Submit current file to Codeforces
-   command! CFSubmit write | execute '!codeforces submit ' . shellescape(expand('%:p'))
-   nnoremap <leader>cs :CFSubmit<CR>
-   " Also map F5 to submit
+     command! CFSubmit write | execute '!bash -ic "codeforces submit ' . shellescape(expand('%:p')) . '"'
    nnoremap <F5> :CFSubmit<CR>
+   nnoremap <leader>cs :CFSubmit<CR>
    ```
    Then reload Vim:
    ```vim
