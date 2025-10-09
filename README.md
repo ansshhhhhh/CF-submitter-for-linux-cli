@@ -147,7 +147,7 @@ req.end();
 Copy the entire function below and paste it at the end of your shell configuration file (`~/.bashrc` for Bash, or `~/.zshrc` for Zsh).
 
 ```bash
-# Codeforces CLI Submitter with Live Verdict and Detailed Error Reporting
+# Codeforces CLI Submitter with Full Verdict Support
 codeforces() {
   # --- Step 0: Initial checks and passthrough ---
   if [[ "$1" != "submit" ]]; then
@@ -201,7 +201,6 @@ codeforces() {
   # --- Step 3: Submit the solution ---
   local submission_time_start=$(( $(date +%s) - 5 ))
 
-  # FIX: Launch from a subshell to silence all job control messages permanently.
   local CPID=$(nohup ~/.cp-helper/companion.js &>/dev/null & echo $!)
   
   sleep 0.2
@@ -219,9 +218,10 @@ codeforces() {
   
   sleep 1
 
-  # --- Step 4: Poll for verdict and update cache on success ---
+  # --- Step 4: Poll for verdict with 3-line updating display ---
   local check_start_time=$(date +%s)
   local cache_updated=0
+  local first_run=1
   while true; do
     local current_time=$(date +%s)
     local elapsed_time=$(( current_time - check_start_time ))
@@ -230,9 +230,10 @@ codeforces() {
     LATEST_SUB=$(curl -s "$API_URL" | jq ".result[] | select(.problem.index == \"$idx\" and .creationTimeSeconds >= $submission_time_start)" | jq -s '.[0]')
 
     if [ -z "$LATEST_SUB" ] || [ "$LATEST_SUB" = "null" ]; then
-      if (( elapsed_time > 5 )); then
+      # UPDATED: Timeout is now 15 seconds
+      if (( elapsed_time > 15 )); then
         echo -ne "\033[2K\r"
-        echo -e "\e[31mError: Not Submitted (timed out after 5 seconds)\e[0m"
+        echo -e "\e[31mError: Not Submitted (timed out after 15 seconds)\e[0m"
         return 1
       fi
       
@@ -240,6 +241,11 @@ codeforces() {
       sleep 0.2
       continue
     fi
+    
+    if [[ "$first_run" -eq 0 ]]; then
+      echo -ne "\033[3A"
+    fi
+    first_run=0
     
     if [[ "$cache_updated" -eq 0 ]]; then
       if [[ -n "$old_entry" ]]; then
@@ -251,28 +257,39 @@ codeforces() {
       cache_updated=1
     fi
 
+    local SUB_ID=$(echo "$LATEST_SUB" | jq -r '.id')
     local VERDICT=$(echo "$LATEST_SUB" | jq -r '.verdict')
     local TEST_COUNT=$(echo "$LATEST_SUB" | jq -r '.passedTestCount')
+    local TIME=$(echo "$LATEST_SUB" | jq -r '.timeConsumedMillis')
+    local MEMORY=$(echo "$LATEST_SUB" | jq -r '.memoryConsumedBytes')
+    
+    echo -e "\033[2KSubmission #: $SUB_ID"
 
-    if [ "$VERDICT" != "TESTING" ]; then
-      local TIME=$(echo "$LATEST_SUB" | jq -r '.timeConsumedMillis')
-      local MEMORY=$(echo "$LATEST_SUB" | jq -r '.memoryConsumedBytes')
-      local SUB_ID=$(echo "$LATEST_SUB" | jq -r '.id')
-      
-      echo -ne "\033[2K\r"
-      echo "Submission #: $SUB_ID"
-      if [ "$VERDICT" = "OK" ]; then
-        echo -e "Status: \e[32mAccepted\e[0m"
-      else
-        local failedTest=$(( TEST_COUNT + 1 ))
-        local FORMATTED_VERDICT=$(echo "$VERDICT" | sed 's/_/ /g' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2));}1')
-        echo -e "Status: \e[31m${FORMATTED_VERDICT} on test ${failedTest}\e[0m"
-      fi
-      echo "Time: ${TIME} ms | Memory: $(($MEMORY / 1024)) KB"
-      break
-    else
-      echo -ne "Running on test ${TEST_COUNT}...\r"
-    fi
+    case "$VERDICT" in
+      "TESTING")
+        echo -e "\033[2KStatus: Running on test ${TEST_COUNT}..."
+        echo -e "\033[2KTime: ${TIME} ms | Memory: $(($MEMORY / 1024)) KB"
+        ;;
+      "IN_QUEUE" | "SUBMITTED" | "null")
+        echo -e "\033[2KStatus: In queue..."
+        echo -e "\033[2KTime: ... | Memory: ..."
+        ;;
+      *) # Handle all other verdicts as final
+        if [ "$VERDICT" = "OK" ]; then
+          echo -e "\033[2KStatus: \e[32mAccepted\e[0m"
+        else
+          local failedTest=$(( TEST_COUNT + 1 ))
+          local FORMATTED_VERDICT=$(echo "$VERDICT" | sed 's/_/ /g' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2));}1')
+          if [[ "$VERDICT" == "COMPILATION_ERROR" || "$VERDICT" == "CHALLENGED" || "$VERDICT" == "SKIPPED" || "$VERDICT" == "REJECTED" ]]; then
+            echo -e "\033[2KStatus: \e[31m${FORMATTED_VERDICT}\e[0m"
+          else
+            echo -e "\033[2KStatus: \e[31m${FORMATTED_VERDICT} on test ${failedTest}\e[0m"
+          fi
+        fi
+        echo -e "\033[2KTime: ${TIME} ms | Memory: $(($MEMORY / 1024)) KB"
+        break # Exit loop on final verdict
+        ;;
+    esac
     
     if (( elapsed_time < 15 )); then
       sleep 0.2
