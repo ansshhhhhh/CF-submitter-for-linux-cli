@@ -147,7 +147,7 @@ req.end();
 Copy the entire function below and paste it at the end of your shell configuration file (`~/.bashrc` for Bash, or `~/.zshrc` for Zsh).
 
 ```bash
-# Codeforces CLI Submitter with Live Verdict
+# Codeforces CLI Submitter with Live Verdict and Detailed Error Reporting
 codeforces() {
   # --- Step 0: Initial checks and passthrough ---
   if [[ "$1" != "submit" ]]; then
@@ -157,8 +157,7 @@ codeforces() {
   [[ -f "$file" ]] || { echo "Usage: codeforces submit <file>" >&2; return 1; }
 
   # --- Configuration ---
-  # !!! ACTION REQUIRED: Replace "anshhhhh" with your Codeforces handle !!!
-  local CF_HANDLE="anshhhhh"
+  local CF_HANDLE="anshhhhh" # Your Codeforces handle
 
   # --- Step 1: Robustly parse filenames and language ---
   local fname="$(basename "$file")"
@@ -166,36 +165,47 @@ codeforces() {
   local code="${base%%_*}"
   
   if [[ ! "$code" =~ ^([0-9]+)([A-Za-z][0-9]*)$ ]]; then
-    echo "✖ Error: Could not parse Contest and Problem from '$fname'." >&2
+    echo -e "\e[31mError: Could not parse Contest and Problem from '$fname'.\e[0m" >&2
     echo "  (Example format: 123A.cpp, 987G1.cpp, 1822g1.cpp)" >&2
     return 1
   fi
   local contest="${BASH_REMATCH[1]}"
   local idx_raw="${BASH_REMATCH[2]}"
-  local idx="${idx_raw^^}" # Convert to uppercase for URL/API (e.g., g1 -> G1)
+  local idx="${idx_raw^^}"
 
-  local url="[https://codeforces.com/contest/$](https://codeforces.com/contest/$){contest}/problem/${idx}"
+  local url="https://codeforces.com/contest/${contest}/problem/${idx}"
   local problemName="${contest}${idx}"
   local ext="${file##*.}" langId
   case "$ext" in
     cpp)  langId=54 ;;  # GNU G++17
     py)   langId=31 ;;  # Python 3
     java) langId=60 ;;  # Java 11
-    *)    echo "✖ Unsupported ext: .$ext" >&2; return 1;;
+    *)    echo -e "\e[31mError: Unsupported extension .$ext\e[0m" >&2; return 1;;
   esac
 
-  # --- Step 2: Submit the solution ---
+  # --- Step 2: Check for duplicate submission before sending ---
+  local cache_file="$HOME/.cp-helper/submission_cache.log"
+  touch "$cache_file"
+
+  local new_hash=$(sha256sum "$file" | awk '{print $1}')
+  local old_entry=$(grep "^${problemName}:" "$cache_file")
+
+  if [[ -n "$old_entry" ]]; then
+    local old_hash=$(echo "$old_entry" | cut -d ':' -f 2)
+    if [[ "$new_hash" == "$old_hash" ]]; then
+      echo -e "\e[31mError: You have submitted this exact code before.\e[0m"
+      return 1
+    fi
+  fi
+
+  # --- Step 3: Submit the solution ---
   local submission_time_start=$(( $(date +%s) - 5 ))
 
-  # Temporarily disable job monitoring to hide "[1] PID" messages
-  set +m
-  ~/.cp-helper/companion.js &>/dev/null &
-  local CPID=$!
-  # Re-enable job monitoring immediately after
-  set -m
+  # FIX: Launch from a subshell to silence all job control messages permanently.
+  local CPID=$(nohup ~/.cp-helper/companion.js &>/dev/null & echo $!)
   
   sleep 0.2
-  node ~/.cp-helper/post.js "$file" "$url" "$problemName" "$langId" > /dev/null 2_1
+  node ~/.cp-helper/post.js "$file" "$url" "$problemName" "$langId" > /dev/null 2>&1
   
   if [ $? -ne 0 ]; then
     kill $CPID 2>/dev/null; return 1;
@@ -206,41 +216,69 @@ codeforces() {
     sleep 0.1; (( waited++ ));
   done
   if kill -0 $CPID 2>/dev/null; then kill $CPID; fi
-  sleep 2
+  
+  sleep 1
 
-  # --- Step 3: Poll for the verdict using the API ---
+  # --- Step 4: Poll for verdict and update cache on success ---
+  local check_start_time=$(date +%s)
+  local cache_updated=0
   while true; do
-    API_URL="[https://codeforces.com/api/contest.status?contestId=$](https://codeforces.com/api/contest.status?contestId=$){contest}&handle=${CF_HANDLE}&from=1&count=5"
+    local current_time=$(date +%s)
+    local elapsed_time=$(( current_time - check_start_time ))
+    
+    API_URL="https://codeforces.com/api/contest.status?contestId=${contest}&handle=${CF_HANDLE}&from=1&count=5"
     LATEST_SUB=$(curl -s "$API_URL" | jq ".result[] | select(.problem.index == \"$idx\" and .creationTimeSeconds >= $submission_time_start)" | jq -s '.[0]')
 
     if [ -z "$LATEST_SUB" ] || [ "$LATEST_SUB" = "null" ]; then
+      if (( elapsed_time > 5 )); then
+        echo -ne "\033[2K\r"
+        echo -e "\e[31mError: Not Submitted (timed out after 5 seconds)\e[0m"
+        return 1
+      fi
+      
       echo -ne "Waiting for submission...\r"
-      sleep 2
+      sleep 0.2
       continue
     fi
     
+    if [[ "$cache_updated" -eq 0 ]]; then
+      if [[ -n "$old_entry" ]]; then
+        sed -i "s|^${problemName}:.*|${problemName}:${new_hash}|" "$cache_file"
+      else
+        echo "${problemName}:${new_hash}" >> "$cache_file"
+      fi
+      tail -n 50 "$cache_file" > "${cache_file}.tmp" && mv "${cache_file}.tmp" "$cache_file"
+      cache_updated=1
+    fi
+
     local VERDICT=$(echo "$LATEST_SUB" | jq -r '.verdict')
+    local TEST_COUNT=$(echo "$LATEST_SUB" | jq -r '.passedTestCount')
 
     if [ "$VERDICT" != "TESTING" ]; then
       local TIME=$(echo "$LATEST_SUB" | jq -r '.timeConsumedMillis')
       local MEMORY=$(echo "$LATEST_SUB" | jq -r '.memoryConsumedBytes')
       local SUB_ID=$(echo "$LATEST_SUB" | jq -r '.id')
       
-      echo -ne "\033[2K\r" # Clear the "Running on test..." line
+      echo -ne "\033[2K\r"
       echo "Submission #: $SUB_ID"
       if [ "$VERDICT" = "OK" ]; then
         echo -e "Status: \e[32mAccepted\e[0m"
       else
+        local failedTest=$(( TEST_COUNT + 1 ))
         local FORMATTED_VERDICT=$(echo "$VERDICT" | sed 's/_/ /g' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2));}1')
-        echo -e "Status: \e[31m${FORMATTED_VERDICT}\e[0m"
+        echo -e "Status: \e[31m${FORMATTED_VERDICT} on test ${failedTest}\e[0m"
       fi
       echo "Time: ${TIME} ms | Memory: $(($MEMORY / 1024)) KB"
       break
     else
-      local TEST_COUNT=$(echo "$LATEST_SUB" | jq -r '.passedTestCount')
       echo -ne "Running on test ${TEST_COUNT}...\r"
     fi
-    sleep 2
+    
+    if (( elapsed_time < 15 )); then
+      sleep 0.2
+    else
+      sleep 1
+    fi
   done
 }
 ```
